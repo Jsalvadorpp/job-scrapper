@@ -1,0 +1,27 @@
+# Spins up a local PostgreSQL database for development.
+# Run with: docker compose up -d
+# Stop with: docker compose down
+# Wipe data:  docker compose down -v
+
+services:
+  db:
+    image: postgres:16-alpine # lightweight official Postgres image
+    restart: unless-stopped
+    ports:
+      - "5432:5432" # exposes Postgres on localhost:5432
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: jobscrapper
+    volumes:
+      - pgdata:/var/lib/postgresql/data # persist data between restarts
+    # Healthcheck: Docker will wait until Postgres is actually accepting connections
+    # before marking the container as "healthy" — used by `docker compose up --wait`
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jobscrapper"]
+      interval: 3s # check every 3 seconds
+      timeout: 5s # fail if no response within 5 seconds
+      retries: 10 # try up to 10 times before giving up
+
+volumes:
+  pgdata:

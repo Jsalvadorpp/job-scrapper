@@ -6,3 +6,13 @@ node_modules/
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+
+# Scraper output
+jobs.json
+linkedin-cookies.json
+
+# Inspector dumps
+job-search-page.html
+job-detail-page.html
+analyze.py
+analyze2.py

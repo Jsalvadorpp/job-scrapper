@@ -1,8 +1,18 @@
 {
   "name": "jobsworker",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
-  "scripts": {},
+  "scripts": {
+    "db:up": "docker compose up -d --wait && pnpm db:push",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d --wait && pnpm db:push",
+    "db:push": "drizzle-kit push",
+    "studio": "drizzle-kit studio",
+    "dev": "tsx extractor/scrapper.ts",
+    "dev:24h": "TIME_RANGE=24h tsx extractor/scrapper.ts",
+    "dev:week": "TIME_RANGE=week tsx extractor/scrapper.ts"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -10,11 +20,14 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@types/node": "^25.5.0",
+    "drizzle-kit": "^0.31.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
-    "playwright": "^1.58.2"
+    "drizzle-orm": "^0.43.0",
+    "playwright": "^1.58.2",
+    "postgres": "^3.4.7"
   }
 }
