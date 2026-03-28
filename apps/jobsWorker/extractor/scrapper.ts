@@ -2,6 +2,7 @@ import { chromium } from "playwright";
 import { writeFileSync, readFileSync, existsSync } from "fs";
 import { db } from "../db/client.js";
 import { jobs as jobsTable } from "../db/schema.js";
+import { inArray } from "drizzle-orm";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -17,9 +18,9 @@ const SEARCH_URL =
   `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=software%20engineer&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
 
 // How many job detail pages to open at the same time.
-// 8 is aggressive but safe — job detail pages are independent and LinkedIn
-// doesn't rate-limit them as strictly as search result pages.
-const CONCURRENCY = 8;
+// 5 concurrent requests looks like a human with a few tabs open.
+// Going higher (e.g. 8) causes burst detection and 429s on job detail pages.
+const CONCURRENCY = 5;
 
 // LinkedIn uses this query-param to page through results (0, 25, 50, ...)
 const PAGE_SIZE = 25;
@@ -27,6 +28,10 @@ const PAGE_SIZE = 25;
 // File where we save your LinkedIn session after the first login.
 // On the first run you log in manually — after that it's automatic.
 const COOKIES_FILE = "linkedin-cookies.json";
+
+// URLs that failed to scrape (rate-limited) are saved here so the next run
+// picks them up automatically without re-collecting them from search pages.
+const FAILED_JOBS_FILE = "failed-jobs.json";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -49,7 +54,7 @@ function randomDelay(min = 500, max = 1200): Promise<void> {
 }
 
 // Run an array of async tasks with at most `limit` in-flight at once.
-// This lets us scrape multiple job pages in parallel without hammering LinkedIn.
+// Adds a pause between every batch so LinkedIn doesn't see a sustained burst.
 async function pLimit<T>(
   tasks: (() => Promise<T>)[],
   limit: number
@@ -59,6 +64,11 @@ async function pLimit<T>(
     const batch = tasks.slice(i, i + limit).map((t) => t());
     const settled = await Promise.allSettled(batch);
     results.push(...settled);
+    // Pause between batches — gives LinkedIn's rate-limiter time to cool down
+    // before we open the next set of pages.
+    if (i + limit < tasks.length) {
+      await randomDelay(3000, 6000);
+    }
   }
   return results;
 }
@@ -248,10 +258,43 @@ async function main() {
   const uniqueLinks = allLinks;
   console.log(`\n🔗 Total job links collected: ${uniqueLinks.length}`);
 
+  // ── Load previously failed URLs and merge into queue ──
+  // If a previous run hit rate limits, those URLs were saved to failed-jobs.json.
+  // We retry them now so nothing is permanently lost.
+  const previouslyFailed: string[] = existsSync(FAILED_JOBS_FILE)
+    ? JSON.parse(readFileSync(FAILED_JOBS_FILE, "utf-8"))
+    : [];
+  if (previouslyFailed.length > 0) {
+    console.log(`♻️  Retrying ${previouslyFailed.length} previously failed URLs...`);
+    for (const url of previouslyFailed) {
+      if (!seenIds.has(url)) {
+        seenIds.add(url);
+        uniqueLinks.push(url);
+      }
+    }
+  }
+
+  // ── Skip jobs already stored in the DB ──
+  // Query all existing URLs in one go, then filter the queue down to only
+  // new jobs. This avoids hitting LinkedIn for data we already have.
+  const existingUrls = uniqueLinks.length > 0
+    ? (await db
+        .select({ url: jobsTable.url })
+        .from(jobsTable)
+        .where(inArray(jobsTable.url, uniqueLinks)))
+        .map((r) => r.url)
+    : [];
+  const existingUrlSet = new Set(existingUrls);
+  const toScrape = uniqueLinks.filter((u) => !existingUrlSet.has(u));
+  console.log(`⏭️  Skipping ${existingUrls.length} already-stored jobs.`);
+  console.log(`🆕 Need to scrape ${toScrape.length} new jobs.`);
+
   // ── Step 4: Visit each job page and extract details (in parallel) ──
   // We open CONCURRENCY pages at once so the total time ≈ (jobs / CONCURRENCY) × per-job time
   // instead of jobs × per-job time.
-  console.log(`⚡ Scraping ${uniqueLinks.length} jobs (${CONCURRENCY} at a time)...`);
+  console.log(`⚡ Scraping ${toScrape.length} jobs (${CONCURRENCY} at a time)...`);
+
+  const failedUrls: string[] = [];
 
   async function scrapeJob(url: string): Promise<Job> {
     const jobPage = await context.newPage();
@@ -262,7 +305,26 @@ async function main() {
       (route) => route.abort()
     );
     try {
-      await jobPage.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      // Retry the job page on rate-limit errors (same strategy as search pages).
+      // LinkedIn occasionally 429s individual job pages — a short wait + retry
+      // clears it without losing the URL.
+      let navOk = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await jobPage.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+          navOk = true;
+          break;
+        } catch (err) {
+          if (attempt < 3) {
+            const waitSec = 30 * attempt; // 30s, 60s
+            console.log(`⚠️  Rate-limited on job page (attempt ${attempt}/3) — waiting ${waitSec}s...`);
+            await jobPage.waitForTimeout(waitSec * 1_000);
+          } else {
+            throw err; // exhaust retries → bubble up to pLimit error handler
+          }
+        }
+      }
+      if (!navOk) throw new Error(`Failed to load ${url} after 3 attempts`);
 
       // Wait for the description box — this fires as soon as the content is ready
       // instead of always waiting a fixed 4 seconds.
@@ -347,10 +409,14 @@ async function main() {
     }
   }
 
-  // Build a task list and run them CONCURRENCY at a time
-  const tasks = uniqueLinks.map(
+  // Build a task list and run them CONCURRENCY at a time.
+  // Each job is staggered within its batch: job 0 starts immediately,
+  // job 1 after ~1-2s, job 2 after ~2-4s. This avoids all CONCURRENCY
+  // requests landing on LinkedIn at the exact same millisecond.
+  const tasks = toScrape.map(
     (url, i) => async () => {
-      if (i > 0) await randomDelay(100, 300); // minimal stagger — just enough to avoid burst
+      const posInBatch = i % CONCURRENCY;
+      if (posInBatch > 0) await randomDelay(1000 * posInBatch, 1000 * posInBatch + 2000);
       return scrapeJob(url);
     }
   );
@@ -360,10 +426,20 @@ async function main() {
   const jobs: Job[] = settled
     .map((r, i) => {
       if (r.status === "fulfilled") return r.value;
-      console.error(`❌ Failed to scrape ${uniqueLinks[i]}: ${(r.reason as Error).message}`);
+      const failedUrl = toScrape[i];
+      console.error(`❌ Failed to scrape ${failedUrl}: ${(r.reason as Error).message}`);
+      failedUrls.push(failedUrl); // save for retry on next run
       return null;
     })
     .filter((j): j is Job => j !== null);
+
+  // Persist failed URLs so the next run retries them automatically
+  writeFileSync(FAILED_JOBS_FILE, JSON.stringify(failedUrls, null, 2));
+  if (failedUrls.length > 0) {
+    console.log(`\n⚠️  ${failedUrls.length} jobs failed (rate-limited). Saved to ${FAILED_JOBS_FILE} — will retry next run.`);
+  } else {
+    console.log(`\n✅ No failures — cleared ${FAILED_JOBS_FILE}.`);
+  }
 
   // ── Step 5: Save to jobs.json (backup) and insert into PostgreSQL ──
 

@@ -9,6 +9,7 @@ node_modules/
 
 # Scraper output
 jobs.json
+failed-jobs.json
 linkedin-cookies.json
 
 # Inspector dumps
