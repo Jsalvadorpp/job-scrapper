@@ -29,7 +29,7 @@ const result = await page.$$eval("li[data-occludable-job-id]", (els) =>
   els.map((e) => ({
     id: e.getAttribute("data-occludable-job-id"),
     href: e.querySelector("a")?.getAttribute("href")?.slice(0, 80) ?? null,
-    text: e.innerText.slice(0, 50).replace(/\n/g, " "),
+    text: (e as HTMLElement).innerText.slice(0, 50).replace(/\n/g, " "),
   }))
 );
 

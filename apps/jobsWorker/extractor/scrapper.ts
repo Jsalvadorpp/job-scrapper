@@ -1,8 +1,8 @@
 import { chromium } from "playwright";
 import { writeFileSync, readFileSync, existsSync } from "fs";
 import { db } from "../db/client.js";
-import { jobs as jobsTable } from "../db/schema.js";
-import { inArray } from "drizzle-orm";
+import { jobs as jobsTable, blockedCompanies, blockedKeywords, requiredKeywords } from "../db/schema.js";
+import { asc, inArray } from "drizzle-orm";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -14,8 +14,35 @@ import { inArray } from "drizzle-orm";
 //   pnpm dev:24h    → last 24 hours  (f_TPR=r86400)
 //   pnpm dev:week   → last 7 days    (f_TPR=r604800)
 const TIME_RANGE = process.env.TIME_RANGE === "week" ? "r604800" : "r86400";
-const SEARCH_URL =
-  `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=software%20engineer&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
+
+// ─── Boolean keyword builder ──────────────────────────────────────────────
+// Combines required_keywords (OR'd together) and blocked_keywords (NOT'd)
+// into a single LinkedIn-compatible Boolean string.
+// e.g. required=["react","typescript"], blocked=["senior","manager"]
+//   → "(react OR typescript) NOT (senior OR manager)"
+// Falls back to "software engineer" when no required keywords are stored.
+function buildKeywordQuery(required: string[], blocked: string[]): string {
+  let query =
+    required.length === 0
+      ? "software engineer"
+      : required.length === 1
+      ? required[0]!
+      : `(${required.join(" OR ")})`;
+
+  if (blocked.length > 0) {
+    const notPart =
+      blocked.length === 1
+        ? `NOT ${blocked[0]!}`
+        : `NOT (${blocked.join(" OR ")})`;
+    query = `${query} ${notPart}`;
+  }
+
+  return query;
+}
+
+function buildSearchUrl(keywordQuery: string): string {
+  return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=${encodeURIComponent(keywordQuery)}&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
+}
 
 // How many job detail pages to open at the same time.
 // 5 concurrent requests looks like a human with a few tabs open.
@@ -78,6 +105,26 @@ async function pLimit<T>(
 async function main() {
   console.log("🚀 Starting scraper...");
   console.log(`📅 Time range: ${process.env.TIME_RANGE === "week" ? "last 7 days" : "last 24 hours"}`);
+
+  // ── Load filters from DB ─────────────────────────────────────────────────
+  const [reqRows, blockedKwRows, blockedCoRows] = await Promise.all([
+    db.select().from(requiredKeywords).orderBy(asc(requiredKeywords.keyword)),
+    db.select().from(blockedKeywords).orderBy(asc(blockedKeywords.keyword)),
+    db.select().from(blockedCompanies).orderBy(asc(blockedCompanies.name)),
+  ]);
+
+  const reqList   = reqRows.map((r) => r.keyword);
+  const blockedKwList = blockedKwRows.map((r) => r.keyword);
+  // Normalised set for fast O(1) lookups during listing-card filtering
+  const blockedCoSet  = new Set(blockedCoRows.map((r) => r.name.toLowerCase()));
+
+  const keywordQuery = buildKeywordQuery(reqList, blockedKwList);
+  const SEARCH_URL   = buildSearchUrl(keywordQuery);
+
+  console.log(`🔍 Keyword query: "${keywordQuery}"`);
+  if (blockedCoRows.length > 0) {
+    console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
+  }
 
   const browser = await chromium.launch({
     headless: false, // set to true once you're happy with results
@@ -219,26 +266,42 @@ async function main() {
     await page.waitForTimeout(1_500);
 
     // Each real job card stores its ID in data-occludable-job-id.
-    // Extract those IDs directly and build URLs from them — much more reliable
-    // than hunting for <a> links which may not render for off-screen cards.
-    const pageLinks = await page.$$eval(
+    // We also extract the company name so we can skip blocked companies
+    // before ever opening a detail page.
+    const pageCards = await page.$$eval(
       "li[data-occludable-job-id]",
       (items) =>
         items
-          .map((li) => li.getAttribute("data-occludable-job-id"))
-          .filter((id): id is string => !!id && /^\d+$/.test(id))
-          .map((id) => `https://www.linkedin.com/jobs/view/${id}/`)
+          .map((li) => {
+            const id = li.getAttribute("data-occludable-job-id");
+            if (!id || !/^\d+$/.test(id)) return null;
+            // Try several selectors LinkedIn has used for the company subtitle
+            const companyEl =
+              li.querySelector(".job-card-container__primary-description") ??
+              li.querySelector(".artdeco-entity-lockup__subtitle span") ??
+              li.querySelector(".job-card-container__subtitle");
+            const company = companyEl?.textContent?.trim() ?? "";
+            return { id, company };
+          })
+          .filter((c): c is { id: string; company: string } => c !== null)
     );
 
     let newOnThisPage = 0;
-    for (const link of pageLinks) {
-      const idMatch = link.match(/\/jobs\/view\/(\d+)/);
-      const jobId = idMatch?.[1];
-      if (jobId && !seenIds.has(jobId)) {
-        seenIds.add(jobId);
+    let skippedBlocked = 0;
+    for (const { id, company } of pageCards) {
+      if (blockedCoSet.size > 0 && company && blockedCoSet.has(company.toLowerCase())) {
+        skippedBlocked++;
+        continue; // skip detail-page request entirely
+      }
+      const link = `https://www.linkedin.com/jobs/view/${id}/`;
+      if (!seenIds.has(id)) {
+        seenIds.add(id);
         allLinks.push(link);
         newOnThisPage++;
       }
+    }
+    if (skippedBlocked > 0) {
+      console.log(`🚫 Skipped ${skippedBlocked} jobs from blocked companies on this page`);
     }
 
     console.log(`📃 Page ${pageIndex + 1}: found ${newOnThisPage} new links (${allLinks.length} total)`);
@@ -426,7 +489,7 @@ async function main() {
   const jobs: Job[] = settled
     .map((r, i) => {
       if (r.status === "fulfilled") return r.value;
-      const failedUrl = toScrape[i];
+      const failedUrl = toScrape[i]!;
       console.error(`❌ Failed to scrape ${failedUrl}: ${(r.reason as Error).message}`);
       failedUrls.push(failedUrl); // save for retry on next run
       return null;
