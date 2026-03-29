@@ -20,7 +20,7 @@ const SEARCH_URL =
 // How many job detail pages to open at the same time.
 // 5 concurrent requests looks like a human with a few tabs open.
 // Going higher (e.g. 8) causes burst detection and 429s on job detail pages.
-const CONCURRENCY = 4;
+const CONCURRENCY = 3;
 
 // LinkedIn uses this query-param to page through results (0, 25, 50, ...)
 const PAGE_SIZE = 25;
