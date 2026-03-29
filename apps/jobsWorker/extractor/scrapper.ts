@@ -10,10 +10,9 @@ import { asc, inArray } from "drizzle-orm";
 // &start=N is appended automatically during pagination (LinkedIn's own param for paging).
 //
 // TIME_RANGE env var controls the lookback window:
-//   pnpm dev        → defaults to last 24 hours
-//   pnpm dev:24h    → last 24 hours  (f_TPR=r86400)
-//   pnpm dev:week   → last 7 days    (f_TPR=r604800)
-const TIME_RANGE = process.env.TIME_RANGE === "week" ? "r604800" : "r86400";
+//   pnpm dev      → defaults to last 24 hours
+//   pnpm dev:24h  → last 24 hours  (f_TPR=r86400)
+const TIME_RANGE = "r86400"; // fixed to 24 h — week range is too risky
 
 // ─── Boolean keyword builder ──────────────────────────────────────────────
 // Combines required_keywords (OR'd together) and blocked_keywords (NOT'd)
@@ -44,6 +43,51 @@ function buildSearchUrl(keywordQuery: string): string {
   return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=${encodeURIComponent(keywordQuery)}&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
 }
 
+// ─── Browser fingerprint rotation ──────────────────────────────────────────
+// LinkedIn (and their 3rd-party bot-detection partner) fingerprint the browser
+// on every request: User-Agent, sec-ch-ua, platform, viewport, and GPU all need
+// to match. Rotating across a small pool of realistic Chrome/Windows and
+// Chrome/macOS combos means each run looks like a slightly different person.
+const FINGERPRINTS = [
+  {
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="134", "Google Chrome";v="134", "Not(A:Brand";v="99"',
+    platform: "Windows",
+    viewport: { width: 1920, height: 1080 },
+  },
+  {
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="133", "Google Chrome";v="133", "Not(A:Brand";v="99"',
+    platform: "Windows",
+    viewport: { width: 1440, height: 900 },
+  },
+  {
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="134", "Google Chrome";v="134", "Not(A:Brand";v="99"',
+    platform: "macOS",
+    viewport: { width: 1440, height: 900 },
+  },
+  {
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="133", "Google Chrome";v="133", "Not(A:Brand";v="99"',
+    platform: "macOS",
+    viewport: { width: 1536, height: 960 },
+  },
+  {
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    secChUa: '"Chromium";v="134", "Google Chrome";v="134", "Not(A:Brand";v="99"',
+    platform: "Windows",
+    viewport: { width: 1366, height: 768 },
+  },
+];
+// Pick one randomly at startup — stays consistent for the whole run
+const FP = FINGERPRINTS[Math.floor(Math.random() * FINGERPRINTS.length)]!;
+
 // How many job detail pages to open at the same time.
 // 5 concurrent requests looks like a human with a few tabs open.
 // Going higher (e.g. 8) causes burst detection and 429s on job detail pages.
@@ -70,18 +114,67 @@ interface Job {
   description: string;
   workType: string | null;    // "Remote" | "Hybrid" | "On-site" | null
   applicants: string | null;  // e.g. "47 applicants" | null
+  companyLogo: string | null; // LinkedIn CDN image URL — null if not found
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-// Short random pause between requests — just enough to look human, not so long it's slow.
+// Short random pause — uniform random, good for per-item micro-staggering.
 function randomDelay(min = 500, max = 1200): Promise<void> {
   const ms = Math.floor(Math.random() * (max - min + 1)) + min;
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Gaussian (normal) delay — clusters around `mean` ms with std-dev `stddev`.
+// Human reaction times follow a normal distribution, not a flat uniform one.
+// Uses the Box-Muller transform to approximate N(μ, σ).
+function gaussianDelay(mean: number, stddev: number): Promise<void> {
+  const u1 = Math.random() || 1e-10; // avoid log(0)
+  const u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  const ms = Math.max(200, Math.round(mean + z * stddev));
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// 12 % chance of a longer "reading" pause (10–28 s).
+// Simulates a person stopping to actually read a result before moving on.
+async function maybeBreak(): Promise<void> {
+  if (Math.random() < 0.12) {
+    const sec = Math.floor(Math.random() * 18) + 10;
+    console.log(`☕ Human break: pausing ${sec}s…`);
+    await new Promise((r) => setTimeout(r, sec * 1_000));
+  }
+}
+
+// Scroll a page down in small, irregular chunks — like a person reading.
+// `totalPx` is the approximate scroll distance; 0 = auto-choose.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function humanScroll(page: any, totalPx = 0): Promise<void> {
+  const distance = totalPx || Math.floor(Math.random() * 500) + 300;
+  const steps = Math.floor(distance / 100) + Math.floor(Math.random() * 3) + 2;
+  for (let i = 0; i < steps; i++) {
+    const chunk = Math.floor(Math.random() * 120) + 60;
+    await page.evaluate(
+      (amt: number) => window.scrollBy({ top: amt, behavior: "smooth" }),
+      chunk
+    );
+    await randomDelay(60, 220);
+  }
+}
+
+// Move the cursor to a random spot inside the viewport — simulates the idle
+// mouse movement that happens while a person reads a page.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function moveMouseRandomly(page: any): Promise<void> {
+  const vp = page.viewportSize() ?? { width: 1280, height: 800 };
+  const x = Math.floor(Math.random() * vp.width * 0.7 + vp.width * 0.1);
+  const y = Math.floor(Math.random() * vp.height * 0.6 + vp.height * 0.1);
+  await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 12) + 6 });
+}
+
 // Run an array of async tasks with at most `limit` in-flight at once.
-// Adds a pause between every batch so LinkedIn doesn't see a sustained burst.
+// Uses a gaussian delay between batches + an occasional longer break so the
+// burst pattern doesn't look like automated polling.
 async function pLimit<T>(
   tasks: (() => Promise<T>)[],
   limit: number
@@ -91,10 +184,10 @@ async function pLimit<T>(
     const batch = tasks.slice(i, i + limit).map((t) => t());
     const settled = await Promise.allSettled(batch);
     results.push(...settled);
-    // Pause between batches — gives LinkedIn's rate-limiter time to cool down
-    // before we open the next set of pages.
     if (i + limit < tasks.length) {
-      await randomDelay(3000, 6000);
+      // Gaussian inter-batch pause — ~4 s average, ±1.5 s std-dev
+      await gaussianDelay(4_000, 1_500);
+      await maybeBreak();
     }
   }
   return results;
@@ -104,7 +197,7 @@ async function pLimit<T>(
 
 async function main() {
   console.log("🚀 Starting scraper...");
-  console.log(`📅 Time range: ${process.env.TIME_RANGE === "week" ? "last 7 days" : "last 24 hours"}`);
+  console.log(`📅 Time range: last 24 hours`);
 
   // ── Load filters from DB ─────────────────────────────────────────────────
   const [reqRows, blockedKwRows, blockedCoRows] = await Promise.all([
@@ -126,46 +219,60 @@ async function main() {
     console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
   }
 
+  console.log(`👾 Fingerprint: ${FP.platform} ${FP.viewport.width}x${FP.viewport.height}`);
+
   const browser = await chromium.launch({
     headless: false, // set to true once you're happy with results
-    // These flags suppress Chrome's automation banner and some bot-detection signals
     args: [
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-infobars",
+      "--disable-dev-shm-usage",          // avoids /dev/shm crash in constrained envs
+      "--disable-web-security",           // skip CORS preflight that headless-only browsers skip
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--window-size=" + FP.viewport.width + "," + FP.viewport.height,
     ],
   });
 
   const context = await browser.newContext({
-    // Up-to-date Chrome user agent — older values stand out to LinkedIn's bot checks
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    userAgent: FP.userAgent,
     locale: "en-US",
-    timezoneId: "America/New_York", // a plausible timezone for a US Chrome user
-    viewport: { width: 1280, height: 800 },
-    // Tell the server we accept typical browser content types
+    timezoneId: "America/New_York",
+    viewport: FP.viewport,
     extraHTTPHeaders: {
       "Accept-Language": "en-US,en;q=0.9",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "sec-ch-ua": '"Chromium";v="134", "Google Chrome";v="134", "Not(A:Brand";v="99"',
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "sec-ch-ua": FP.secChUa,
       "sec-ch-ua-mobile": "?0",
-      "sec-ch-ua-platform": '"Windows"',
+      "sec-ch-ua-platform": `"${FP.platform}"`,
+      // Typical navigation headers — missing ones are a bot signal
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
     },
   });
 
   // ── Stealth patches ──────────────────────────────────────────────────────
-  // Playwright sets navigator.webdriver = true by default — LinkedIn checks for
-  // this exact flag to identify bots. We also patch a few other properties that
-  // headless browsers commonly expose.
+  // LinkedIn (and their anti-bot partner PerimeterX/HUMAN) fingerprints the
+  // browser on every page load. Each patch below neutralises a specific signal
+  // that headless Chrome leaks by default.
   await context.addInitScript(() => {
-    // 1. Hide the webdriver flag — most important
+    // 1. Hide the webdriver flag — the #1 bot signal
     Object.defineProperty(navigator, "webdriver", { get: () => undefined });
 
-    // 2. Fake a non-empty plugin list (real browsers always have plugins)
-    Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+    // 2. Non-empty plugin list — real Chrome always has at least PDF Viewer etc.
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
 
-    // 3. Advertise realistic language preferences
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    // 3. Realistic language preferences
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["en-US", "en"],
+    });
 
     // 4. Remove the CDP (Chrome DevTools Protocol) runtime leak
     // @ts-ignore
@@ -174,15 +281,53 @@ async function main() {
       window.chrome.runtime = {};
     }
 
-    // 5. Make permission queries look like a normal browser
+    // 5. Permission queries — match the behaviour of a real, non-headless Chrome
     const origQuery = navigator.permissions?.query?.bind(navigator.permissions);
     if (origQuery) {
       // @ts-ignore
       navigator.permissions.query = (params: PermissionDescriptor) =>
         params.name === "notifications"
-          ? Promise.resolve({ state: Notification.permission } as PermissionStatus)
+          ? Promise.resolve({
+              state: Notification.permission,
+            } as PermissionStatus)
           : origQuery(params);
     }
+
+    // 6. Hardware: realistic desktop values (headless often exposes 2 cores / 0 GB)
+    Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 8 });
+    Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+    Object.defineProperty(navigator, "maxTouchPoints", { get: () => 0 }); // no touch = desktop
+
+    // 7. Screen colour depth — 24-bit on every modern monitor
+    Object.defineProperty(screen, "colorDepth", { get: () => 24 });
+    Object.defineProperty(screen, "pixelDepth", { get: () => 24 });
+
+    // 8. WebGL GPU vendor/renderer — commonly fingerprinted to detect VMs / cloud
+    //    Spoofing to a common Intel iGPU is the safest low-profile choice.
+    try {
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function (param: number) {
+        if (param === 37445) return "Intel Inc."; // UNMASKED_VENDOR_WEBGL
+        if (param === 37446) return "Intel Iris OpenGL Engine"; // UNMASKED_RENDERER_WEBGL
+        return getParameter.call(this, param);
+      };
+    } catch {}
+
+    // 9. Network info — typical home broadband values
+    try {
+      // @ts-ignore
+      const conn = navigator.connection;
+      if (conn) {
+        Object.defineProperty(conn, "rtt", { get: () => 100 });
+        Object.defineProperty(conn, "downlink", { get: () => 10 });
+        Object.defineProperty(conn, "effectiveType", { get: () => "4g" });
+      }
+    } catch {}
+
+    // 10. Notification.permission — real browsers return 'default', not 'denied'
+    try {
+      Object.defineProperty(Notification, "permission", { get: () => "default" });
+    } catch {}
   });
 
   // ── Session handling: load saved cookies or ask user to log in ──
@@ -261,9 +406,12 @@ async function main() {
       break;
     }
 
-    // LinkedIn renders the first ~7 cards immediately. Wait until they appear
-    // (or 5s max) rather than a fixed sleep — exits as soon as cards are ready.
+    // Give the first batch of cards time to render, then scroll and wiggle
+    // the mouse — same thing a human does while the page finishes loading.
     await page.waitForTimeout(1_500);
+    await humanScroll(page, 700);          // scroll ~700 px down the results list
+    await moveMouseRandomly(page);          // idle cursor movement while "reading"
+    await randomDelay(400, 900);           // brief pause before extracting
 
     // Each real job card stores its ID in data-occludable-job-id.
     // We also extract the company name so we can skip blocked companies
@@ -315,7 +463,10 @@ async function main() {
 
     await page.close(); // done with this search-results page
     pageIndex++;
-    await randomDelay(2500, 4000); // generous pause between result pages to avoid rate-limits
+    // Gaussian inter-page pause — ~3.5 s average, feels like manually typing
+    // the next page URL. Occasionally adds a longer "reading" break.
+    await gaussianDelay(3_500, 1_000);
+    await maybeBreak();
   }
 
   const uniqueLinks = allLinks;
@@ -374,7 +525,13 @@ async function main() {
       let navOk = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await jobPage.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+          // Add Referer so LinkedIn sees us arriving from a search results page,
+          // not from a direct URL bar navigation (a common bot tell).
+          await jobPage.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 30_000,
+            referer: "https://www.linkedin.com/jobs/search/",
+          });
           navOk = true;
           break;
         } catch (err) {
@@ -389,34 +546,54 @@ async function main() {
       }
       if (!navOk) throw new Error(`Failed to load ${url} after 3 attempts`);
 
-      // Wait for the description box — this fires as soon as the content is ready
-      // instead of always waiting a fixed 4 seconds.
+      // Wait for the description box — fires as soon as content is ready.
       await jobPage
         .waitForSelector(
           '[data-testid="expandable-text-box"], [data-sdui-component*="aboutTheJob"]',
           { timeout: 10_000 }
         )
-        .catch(() => {}); // if it never appears, continue anyway and get what we can
+        .catch(() => {}); // if it never appears, continue anyway
+
+      // Simulate reading: scroll partway down the job description, then pause.
+      // LinkedIn's engagement signals include scroll depth and time-on-page.
+      await humanScroll(jobPage, 500);
+      await moveMouseRandomly(jobPage);
+      await randomDelay(600, 1_400);
 
       // ── Title: always in <title> as "Job Title | Company | LinkedIn" ──
       const rawTitle = await jobPage.title();
       const titleParts = rawTitle.split(" | ");
       const title = titleParts[0]?.trim() || "Unknown title";
 
-      // ── Company: LinkedIn sets aria-label="Company, <Name>." for accessibility ──
-      const company =
-        (await jobPage
-          .evaluate(() => {
-            const el = document.querySelector('[aria-label^="Company, "]');
-            if (!el) return null;
-            return (el.getAttribute("aria-label") ?? "")
-              .replace(/^Company,\s*/, "")
-              .replace(/\.$/, "")
-              .trim();
-          })
-          .catch(() => null)) ??
-        titleParts[1]?.trim() ??
-        "Unknown company";
+      // ── Company name + logo: LinkedIn sets aria-label="Company, <Name>." on the logo link ──
+      // The same element that holds the aria-label also contains the <img> for the logo.
+      const { company, companyLogo } = await jobPage
+        .evaluate(() => {
+          const el = document.querySelector('[aria-label^="Company, "]');
+          const name = el
+            ? (el.getAttribute("aria-label") ?? "")
+                .replace(/^Company,\s*/, "")
+                .replace(/\.$/, "")
+                .trim()
+            : null;
+          // Logo: try <img> inside the link, then nearby containers
+          const imgEl =
+            el?.querySelector("img") ??
+            document.querySelector(".job-details-jobs-unified-top-card__company-logo img") ??
+            document.querySelector(".artdeco-entity-lockup__image img");
+          const logoSrc =
+            imgEl?.getAttribute("src") ??
+            imgEl?.getAttribute("data-delayed-url") ??
+            null;
+          // LinkedIn shrinks logo URLs to tiny sizes (&w=48) — bump to 200 px for clarity
+          const logo = logoSrc
+            ? logoSrc.replace(/(&|\?)w=\d+/gi, "").replace(/&amp;/g, "&")
+            : null;
+          return { company: name, companyLogo: logo };
+        })
+        .catch(() => ({ company: null as string | null, companyLogo: null as string | null }));
+
+      const resolvedCompany = company ?? titleParts[1]?.trim() ?? "Unknown company";
 
       // ── Location + Applicants: both live in the same metadata <p> ──
       // LinkedIn renders: "Colombia · Reposted 15 hours ago · 90 applicants"
@@ -465,8 +642,8 @@ async function main() {
         )
         .then((t) => (t ?? "No description found").trim());
 
-      console.log(`✅ ${title} @ ${company} | ${location} | ${workType ?? "?"}`);
-      return { title, company, location, url, description, workType, applicants };
+      console.log(`✅ ${title} @ ${resolvedCompany} | ${location} | ${workType ?? "?"}`);
+      return { title, company: resolvedCompany, location, url, description, workType, applicants, companyLogo };
     } finally {
       await jobPage.close();
     }

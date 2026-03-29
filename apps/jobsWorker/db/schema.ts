@@ -15,6 +15,7 @@ export const jobs = pgTable("jobs", {
   description: text("description").notNull(),
   workType: text("work_type"),
   applicants: text("applicants"),
+  companyLogo: text("company_logo"),  // LinkedIn CDN URL for the company logo image
   matchScore: integer("match_score"),
   // User-set status: "applied" | "dismissed" | null (null = untouched)
   status: text("status"),
