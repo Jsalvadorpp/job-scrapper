@@ -15,6 +15,7 @@ export interface JobFilters {
   page?: number;           // 1-based, defaults to 1
   showDismissed?: boolean; // include dismissed jobs (default: false)
   statusFilter?: string;   // "applied" | "all" — show only applied, or all non-dismissed
+  hideApplied?: boolean;   // exclude applied jobs from results
 }
 
 function buildWhere(filters: JobFilters) {
@@ -48,6 +49,11 @@ function buildWhere(filters: JobFilters) {
   // Status filter: only show "applied" jobs when requested
   if (filters.statusFilter === "applied") {
     conditions.push(eq(jobs.status, "applied"));
+  }
+
+  // Hide applied: exclude jobs already applied to
+  if (filters.hideApplied) {
+    conditions.push(or(isNull(jobs.status), ne(jobs.status, "applied")));
   }
 
   // Blocked companies: exclude any job whose company is in the blocked_companies table

@@ -52,13 +52,15 @@ export function Filters({ total }: { total: number }) {
   const activeWorkType = params.get("workType") ?? "";
   const activeSort = params.get("sort") ?? "newest";
   const showDismissed = params.get("showDismissed") === "1";
+  const hideApplied = params.get("hideApplied") === "1";
   const statusFilter = params.get("statusFilter") ?? "";
   const hasFilters = !!(
     params.get("search") ||
     params.get("location") ||
     params.get("workType") ||
     params.get("statusFilter") ||
-    params.get("showDismissed")
+    params.get("showDismissed") ||
+    params.get("hideApplied")
   );
 
   function clearAll() {
@@ -139,6 +141,16 @@ export function Filters({ total }: { total: number }) {
           }`}
         >
           ✓ Applied only
+        </button>
+        <button
+          onClick={() => updateParams({ hideApplied: hideApplied ? "" : "1", statusFilter: "", page: "" })}
+          className={`py-2 px-3 text-sm rounded-lg border transition-colors ${
+            hideApplied
+              ? "bg-violet-600 border-violet-600 text-white font-medium"
+              : "border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          Hide applied
         </button>
         <button
           onClick={() => updateParams({ showDismissed: showDismissed ? "" : "1", page: "" })}
