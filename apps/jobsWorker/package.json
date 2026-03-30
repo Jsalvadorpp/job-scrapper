@@ -10,7 +10,8 @@
     "db:push": "drizzle-kit push",
     "studio": "drizzle-kit studio",
     "dev": "tsx extractor/scrapper.ts",
-    "dev:24h": "TIME_RANGE=24h tsx extractor/scrapper.ts"
+    "dev:24h": "TIME_RANGE=24h tsx extractor/scrapper.ts",
+    "dev:16h": "TIME_RANGE=16h tsx extractor/scrapper.ts"
   },
   "keywords": [],
   "author": "",

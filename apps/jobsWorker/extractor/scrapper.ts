@@ -12,37 +12,22 @@ import { asc, inArray } from "drizzle-orm";
 // TIME_RANGE env var controls the lookback window:
 //   pnpm dev      → defaults to last 24 hours
 //   pnpm dev:24h  → last 24 hours  (f_TPR=r86400)
-const TIME_RANGE = "r86400"; // fixed to 24 h — week range is too risky
+//   pnpm dev:16h  → last 16 hours  (f_TPR=r57600)
+//                   Ideal when running at ~9pm — only shows jobs posted after
+//                   ~5am, skipping any noise posted in the middle of the night
+const TIME_RANGE =
+  process.env.TIME_RANGE === "16h" ? "r57600" : "r86400"; // default: 24 h
 
-// ─── Boolean keyword builder ──────────────────────────────────────────────
-// Required keywords are OR'd for positive matching.
-// Blocked keywords are NOT'd to pre-filter results at the LinkedIn level,
-// which reduces the number of pages returned and limits rate-limit exposure.
-// Important: LinkedIn applies NOT to the full posting text, so it may
-// occasionally drop valid jobs — the local passesContentFilter() acts as a
-// safety net to catch any false positives that still slip through.
-// Falls back to "software engineer" when no required keywords are stored.
-function buildKeywordQuery(required: string[], blocked: string[]): string {
-  let query =
-    required.length === 0
-      ? "software engineer"
-      : required.length === 1
-      ? required[0]!
-      : `(${required.join(" OR ")})`;
-
-  if (blocked.length > 0) {
-    const notPart =
-      blocked.length === 1
-        ? `NOT ${blocked[0]!}`
-        : `NOT (${blocked.join(" OR ")})`;
-    query = `${query} ${notPart}`;
-  }
-
-  return query;
-}
-
-function buildSearchUrl(keywordQuery: string): string {
-  return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=${encodeURIComponent(keywordQuery)}&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
+// ─── Search URL builder ───────────────────────────────────────────────────
+// LinkedIn's Boolean search is unreliable — complex queries cause it to return
+// unrelated results or silently drop valid jobs. We keep the LinkedIn query as
+// simple as possible ("software engineer" exact phrase) and rely entirely on
+// the local three-layer filter to enforce the user's preferences precisely:
+//   1. Listing-card loop  — skips by company + title before opening detail pages
+//   2. passesContentFilter — title (ROLE_KEYWORDS) + description (reqList) + blocked company
+//   3. DB insert           — onConflictDoNothing deduplication
+function buildSearchUrl(): string {
+  return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=${encodeURIComponent('"software engineer"')}&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
 }
 
 // ─── Browser fingerprint rotation ──────────────────────────────────────────
@@ -105,6 +90,21 @@ const COOKIES_FILE = "linkedin-cookies.json";
 // URLs that failed to scrape (rate-limited) are saved here so the next run
 // picks them up automatically without re-collecting them from search pages.
 const FAILED_JOBS_FILE = "failed-jobs.json";
+
+// Fallback title keywords used when required_keywords table is empty.
+// A listing-card title must contain at least one of these to be queued.
+// When required_keywords ARE set those are used instead (they already encode
+// the user's stack), so this list is just a safety net against off-topic roles
+// like Graphic Designer, Clinical Coordinator, Reservation Specialist, etc.
+const ROLE_KEYWORDS = [
+  "software", "engineer", "developer", "dev",
+  "backend", "back-end", "back end",
+  "frontend", "front-end", "front end",
+  "fullstack", "full-stack", "full stack",
+  "python", "node", "node.js", "javascript", "typescript",
+  "react", "vue", "angular",
+  "data", "devops", "sre", "cloud", "platform",
+];
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -199,7 +199,7 @@ async function pLimit<T>(
 
 async function main() {
   console.log("🚀 Starting scraper...");
-  console.log(`📅 Time range: last 24 hours`);
+  console.log(`📅 Time range: ${process.env.TIME_RANGE === "16h" ? "last 16 hours" : "last 24 hours"}`);
 
   // ── Load filters from DB ─────────────────────────────────────────────────
   const [reqRows, blockedKwRows, blockedCoRows] = await Promise.all([
@@ -213,10 +213,9 @@ async function main() {
   // Normalised set for fast O(1) lookups during listing-card filtering
   const blockedCoSet  = new Set(blockedCoRows.map((r) => r.name.toLowerCase()));
 
-  const keywordQuery = buildKeywordQuery(reqList, blockedKwList);
-  const SEARCH_URL   = buildSearchUrl(keywordQuery);
+  const SEARCH_URL = buildSearchUrl();
 
-  console.log(`🔍 Keyword query: "${keywordQuery}"`);
+  console.log(`🔍 Search URL: "software engineer" (filters applied locally)`);
   if (blockedCoRows.length > 0) {
     console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
   }
@@ -465,6 +464,15 @@ async function main() {
           continue;
         }
       }
+
+      // Positive title check: title must contain at least one entry from the
+      // hardcoded ROLE_KEYWORDS list — catches off-topic roles (Graphic Designer,
+      // Clinical Coordinator, etc.) before we ever open their detail pages.
+      const hasTitleMatch = ROLE_KEYWORDS.some((kw) => titleLower.includes(kw.toLowerCase()));
+      if (!hasTitleMatch) {
+        skippedBlocked++;
+        continue;
+      }
       const link = `https://www.linkedin.com/jobs/view/${id}/`;
       if (!seenIds.has(id)) {
         seenIds.add(id);
@@ -709,9 +717,10 @@ async function main() {
   // LinkedIn's Boolean search is not perfectly reliable — it sometimes returns
   // jobs that don't match the query at all (especially the NOT clauses).
   // We run a strict local check on the scraped text before touching the DB:
-  //   • If required keywords exist → title OR description must contain at least one
-  //   • If blocked keywords exist  → title must NOT contain any of them
-  //   • If blocked companies exist → company must NOT be in the blocked set
+  //   • Title must contain at least one tech-role keyword (reqList or ROLE_KEYWORDS fallback)
+  //   • If required keywords exist  → title OR description must contain at least one
+  //   • If blocked keywords exist   → title must NOT contain any of them
+  //   • If blocked companies exist  → company must NOT be in the blocked set
   // Anything that fails is logged and discarded silently.
   function passesContentFilter(job: Job): boolean {
     const titleLower = job.title.toLowerCase();
@@ -721,6 +730,14 @@ async function main() {
     // Blocked company check (second line of defence after the listing-page skip)
     if (blockedCoSet.size > 0 && blockedCoSet.has(compLower)) {
       console.log(`🚫 [filter] Blocked company skipped: "${job.company}" — ${job.title}`);
+      return false;
+    }
+
+    // Positive title check: always uses ROLE_KEYWORDS (hardcoded tech-role list).
+    // reqList (user's required keywords) is for description matching only.
+    const hasTitleMatch = ROLE_KEYWORDS.some((kw) => titleLower.includes(kw.toLowerCase()));
+    if (!hasTitleMatch) {
+      console.log(`🚫 [filter] Off-topic title: "${job.title}" @ ${job.company}`);
       return false;
     }
 
