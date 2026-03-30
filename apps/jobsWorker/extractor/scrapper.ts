@@ -19,15 +19,14 @@ const TIME_RANGE =
   process.env.TIME_RANGE === "16h" ? "r57600" : "r86400"; // default: 24 h
 
 // ─── Search URL builder ───────────────────────────────────────────────────
-// LinkedIn's Boolean search is unreliable — complex queries cause it to return
-// unrelated results or silently drop valid jobs. We keep the LinkedIn query as
-// simple as possible ("software engineer" exact phrase) and rely entirely on
-// the local three-layer filter to enforce the user's preferences precisely:
+// Keep the LinkedIn query broad ("software engineer" without quotes, no geoId)
+// to match what LinkedIn returns when searched manually. All quality filtering
+// is done locally across three layers:
 //   1. Listing-card loop  — skips by company + title before opening detail pages
 //   2. passesContentFilter — title (ROLE_KEYWORDS) + description (reqList) + blocked company
 //   3. DB insert           — onConflictDoNothing deduplication
 function buildSearchUrl(): string {
-  return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&keywords=${encodeURIComponent('"software engineer"')}&geoId=91000011&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
+  return `https://www.linkedin.com/jobs/search/?f_TPR=${TIME_RANGE}&f_WT=2&geoId=91000011&keywords=${encodeURIComponent("software engineer")}&origin=JOB_SEARCH_PAGE_JOB_FILTER&refresh=true`;
 }
 
 // ─── Browser fingerprint rotation ──────────────────────────────────────────
@@ -215,7 +214,7 @@ async function main() {
 
   const SEARCH_URL = buildSearchUrl();
 
-  console.log(`🔍 Search URL: "software engineer" (filters applied locally)`);
+  console.log(`🔍 Search URL: software engineer — broad match, filters applied locally`);
   if (blockedCoRows.length > 0) {
     console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
   }
