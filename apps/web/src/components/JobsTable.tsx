@@ -1,6 +1,7 @@
 import type { Job } from "@/lib/schema";
 import { RowActions } from "@/components/RowActions";
 import { BlockCompanyButton } from "@/components/BlockCompanyButton";
+import { CompanyLogo } from "@/components/CompanyLogo";
 
 const WORK_TYPE_STYLES: Record<string, string> = {
   Remote: "bg-emerald-100 text-emerald-700",
@@ -79,24 +80,7 @@ export function JobsTable({ jobs }: { jobs: Job[] }) {
                 </td>
                 <td className="px-4 py-3 text-slate-600 whitespace-nowrap">
                   <span className="flex items-center gap-2">
-                    {job.companyLogo ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={job.companyLogo}
-                        alt={job.company}
-                        width={28}
-                        height={28}
-                        className="rounded-md object-contain border border-slate-100 bg-white shrink-0"
-                        loading="lazy"
-                        onError={(e) => {
-                          (e.currentTarget as HTMLImageElement).style.display = "none";
-                        }}
-                      />
-                    ) : (
-                      <span className="w-7 h-7 rounded-md bg-slate-100 text-slate-500 text-xs font-bold flex items-center justify-center shrink-0 uppercase">
-                        {job.company.charAt(0)}
-                      </span>
-                    )}
+                    <CompanyLogo src={job.companyLogo ?? null} company={job.company} />
                     {job.company}
                     <BlockCompanyButton company={job.company} />
                   </span>

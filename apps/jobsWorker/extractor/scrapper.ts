@@ -15,28 +15,20 @@ import { asc, inArray } from "drizzle-orm";
 const TIME_RANGE = "r86400"; // fixed to 24 h — week range is too risky
 
 // ─── Boolean keyword builder ──────────────────────────────────────────────
-// Combines required_keywords (OR'd together) and blocked_keywords (NOT'd)
-// into a single LinkedIn-compatible Boolean string.
-// e.g. required=["react","typescript"], blocked=["senior","manager"]
-//   → "(react OR typescript) NOT (senior OR manager)"
+// Only required keywords go into the LinkedIn URL — they do positive matching
+// (show me jobs about X) which LinkedIn handles reliably.
+//
+// Blocked keywords are intentionally NOT included here because LinkedIn applies
+// NOT to the entire posting (title + description + company), which silently
+// drops valid jobs whose description merely mentions a blocked word.
+// Instead, blocked keywords are enforced locally in passesContentFilter()
+// against the title only — where it's safe and precise.
+//
 // Falls back to "software engineer" when no required keywords are stored.
-function buildKeywordQuery(required: string[], blocked: string[]): string {
-  let query =
-    required.length === 0
-      ? "software engineer"
-      : required.length === 1
-      ? required[0]!
-      : `(${required.join(" OR ")})`;
-
-  if (blocked.length > 0) {
-    const notPart =
-      blocked.length === 1
-        ? `NOT ${blocked[0]!}`
-        : `NOT (${blocked.join(" OR ")})`;
-    query = `${query} ${notPart}`;
-  }
-
-  return query;
+function buildKeywordQuery(required: string[]): string {
+  if (required.length === 0) return "software engineer";
+  if (required.length === 1) return required[0]!;
+  return `(${required.join(" OR ")})`;
 }
 
 function buildSearchUrl(keywordQuery: string): string {
@@ -211,10 +203,13 @@ async function main() {
   // Normalised set for fast O(1) lookups during listing-card filtering
   const blockedCoSet  = new Set(blockedCoRows.map((r) => r.name.toLowerCase()));
 
-  const keywordQuery = buildKeywordQuery(reqList, blockedKwList);
+  const keywordQuery = buildKeywordQuery(reqList);
   const SEARCH_URL   = buildSearchUrl(keywordQuery);
 
-  console.log(`🔍 Keyword query: "${keywordQuery}"`);
+  console.log(`🔍 Keyword query: "${keywordQuery}" (blocked keywords applied locally on title)`);
+  if (blockedKwList.length > 0) {
+    console.log(`🚫 Blocked title keywords (${blockedKwList.length}) — local filter only`);
+  }
   if (blockedCoRows.length > 0) {
     console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
   }
@@ -681,15 +676,63 @@ async function main() {
     console.log(`\n✅ No failures — cleared ${FAILED_JOBS_FILE}.`);
   }
 
-  // ── Step 5: Save to jobs.json (backup) and insert into PostgreSQL ──
+  // ── Step 5: Local content validation ────────────────────────────────────
+  // LinkedIn's Boolean search is not perfectly reliable — it sometimes returns
+  // jobs that don't match the query at all (especially the NOT clauses).
+  // We run a strict local check on the scraped text before touching the DB:
+  //   • If required keywords exist → title OR description must contain at least one
+  //   • If blocked keywords exist  → title must NOT contain any of them
+  //   • If blocked companies exist → company must NOT be in the blocked set
+  // Anything that fails is logged and discarded silently.
+  function passesContentFilter(job: Job): boolean {
+    const titleLower = job.title.toLowerCase();
+    const descLower  = job.description.toLowerCase();
+    const compLower  = job.company.toLowerCase();
+
+    // Blocked company check (second line of defence after the listing-page skip)
+    if (blockedCoSet.size > 0 && blockedCoSet.has(compLower)) {
+      console.log(`🚫 [filter] Blocked company skipped: "${job.company}" — ${job.title}`);
+      return false;
+    }
+
+    // Required keyword: title OR description must contain at least one
+    if (reqList.length > 0) {
+      const hit = reqList.some(
+        (kw) => titleLower.includes(kw.toLowerCase()) || descLower.includes(kw.toLowerCase())
+      );
+      if (!hit) {
+        console.log(`🚫 [filter] No required keyword found: "${job.title}" @ ${job.company}`);
+        return false;
+      }
+    }
+
+    // Blocked keyword: title must NOT contain any
+    if (blockedKwList.length > 0) {
+      const hit = blockedKwList.find((kw) => titleLower.includes(kw.toLowerCase()));
+      if (hit) {
+        console.log(`🚫 [filter] Blocked keyword "${hit}" in title: "${job.title}" @ ${job.company}`);
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  const filteredJobs = jobs.filter(passesContentFilter);
+  const discarded = jobs.length - filteredJobs.length;
+  if (discarded > 0) {
+    console.log(`\n🧹 Local filter removed ${discarded} job(s) that slipped through LinkedIn's search.`);
+  }
+
+  // ── Step 6: Save to jobs.json (backup) and insert into PostgreSQL ──
 
   // Backup to file — useful for debugging even when DB is running
-  writeFileSync("jobs.json", JSON.stringify(jobs, null, 2));
-  console.log(`\n💾 Saved ${jobs.length} jobs to jobs.json`);
+  writeFileSync("jobs.json", JSON.stringify(filteredJobs, null, 2));
+  console.log(`\n💾 Saved ${filteredJobs.length} jobs to jobs.json`);
 
   // Insert into PostgreSQL — skip duplicates (same URL already exists)
   let saved = 0;
-  for (const job of jobs) {
+  for (const job of filteredJobs) {
     try {
       await db.insert(jobsTable).values(job).onConflictDoNothing();
       saved++;
@@ -698,7 +741,7 @@ async function main() {
     }
   }
 
-  console.log(`🎉 Done! Inserted ${saved}/${jobs.length} new jobs into PostgreSQL`);
+  console.log(`🎉 Done! Inserted ${saved}/${filteredJobs.length} new jobs into PostgreSQL`);
 
   await browser.close();
 }
