@@ -15,20 +15,30 @@ import { asc, inArray } from "drizzle-orm";
 const TIME_RANGE = "r86400"; // fixed to 24 h — week range is too risky
 
 // ─── Boolean keyword builder ──────────────────────────────────────────────
-// Only required keywords go into the LinkedIn URL — they do positive matching
-// (show me jobs about X) which LinkedIn handles reliably.
-//
-// Blocked keywords are intentionally NOT included here because LinkedIn applies
-// NOT to the entire posting (title + description + company), which silently
-// drops valid jobs whose description merely mentions a blocked word.
-// Instead, blocked keywords are enforced locally in passesContentFilter()
-// against the title only — where it's safe and precise.
-//
+// Required keywords are OR'd for positive matching.
+// Blocked keywords are NOT'd to pre-filter results at the LinkedIn level,
+// which reduces the number of pages returned and limits rate-limit exposure.
+// Important: LinkedIn applies NOT to the full posting text, so it may
+// occasionally drop valid jobs — the local passesContentFilter() acts as a
+// safety net to catch any false positives that still slip through.
 // Falls back to "software engineer" when no required keywords are stored.
-function buildKeywordQuery(required: string[]): string {
-  if (required.length === 0) return "software engineer";
-  if (required.length === 1) return required[0]!;
-  return `(${required.join(" OR ")})`;
+function buildKeywordQuery(required: string[], blocked: string[]): string {
+  let query =
+    required.length === 0
+      ? "software engineer"
+      : required.length === 1
+      ? required[0]!
+      : `(${required.join(" OR ")})`;
+
+  if (blocked.length > 0) {
+    const notPart =
+      blocked.length === 1
+        ? `NOT ${blocked[0]!}`
+        : `NOT (${blocked.join(" OR ")})`;
+    query = `${query} ${notPart}`;
+  }
+
+  return query;
 }
 
 function buildSearchUrl(keywordQuery: string): string {
@@ -203,12 +213,12 @@ async function main() {
   // Normalised set for fast O(1) lookups during listing-card filtering
   const blockedCoSet  = new Set(blockedCoRows.map((r) => r.name.toLowerCase()));
 
-  const keywordQuery = buildKeywordQuery(reqList);
+  const keywordQuery = buildKeywordQuery(reqList, blockedKwList);
   const SEARCH_URL   = buildSearchUrl(keywordQuery);
 
-  console.log(`🔍 Keyword query: "${keywordQuery}" (blocked keywords applied locally on title)`);
-  if (blockedKwList.length > 0) {
-    console.log(`🚫 Blocked title keywords (${blockedKwList.length}) — local filter only`);
+  console.log(`🔍 Keyword query: "${keywordQuery}"`);
+  if (blockedCoRows.length > 0) {
+    console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
   }
   if (blockedCoRows.length > 0) {
     console.log(`🚫 Blocked companies (${blockedCoRows.length}): ${blockedCoRows.map((c) => c.name).join(", ")}`);
@@ -409,8 +419,8 @@ async function main() {
     await randomDelay(400, 900);           // brief pause before extracting
 
     // Each real job card stores its ID in data-occludable-job-id.
-    // We also extract the company name so we can skip blocked companies
-    // before ever opening a detail page.
+    // We extract company AND title so we can skip blocked companies/keywords
+    // before ever opening a detail page (saves rate-limit budget).
     const pageCards = await page.$$eval(
       "li[data-occludable-job-id]",
       (items) =>
@@ -418,23 +428,42 @@ async function main() {
           .map((li) => {
             const id = li.getAttribute("data-occludable-job-id");
             if (!id || !/^\d+$/.test(id)) return null;
-            // Try several selectors LinkedIn has used for the company subtitle
+            // Company subtitle — several selectors LinkedIn has used over time
             const companyEl =
               li.querySelector(".job-card-container__primary-description") ??
               li.querySelector(".artdeco-entity-lockup__subtitle span") ??
               li.querySelector(".job-card-container__subtitle");
             const company = companyEl?.textContent?.trim() ?? "";
-            return { id, company };
+            // Title — the clickable job title link
+            const titleEl =
+              li.querySelector(".job-card-list__title") ??
+              li.querySelector(".job-card-container__link") ??
+              li.querySelector("a[data-control-name=\"jobcard_title\"]");
+            const title = titleEl?.textContent?.trim() ?? "";
+            return { id, company, title };
           })
-          .filter((c): c is { id: string; company: string } => c !== null)
+          .filter((c): c is { id: string; company: string; title: string } => c !== null)
     );
 
     let newOnThisPage = 0;
     let skippedBlocked = 0;
-    for (const { id, company } of pageCards) {
-      if (blockedCoSet.size > 0 && company && blockedCoSet.has(company.toLowerCase())) {
+    for (const { id, company, title } of pageCards) {
+      const compLower  = company.toLowerCase();
+      const titleLower = title.toLowerCase();
+
+      // Skip blocked companies
+      if (blockedCoSet.size > 0 && company && blockedCoSet.has(compLower)) {
         skippedBlocked++;
-        continue; // skip detail-page request entirely
+        continue;
+      }
+
+      // Skip jobs whose listing-card title already matches a blocked keyword
+      if (blockedKwList.length > 0) {
+        const hitKw = blockedKwList.find((kw) => titleLower.includes(kw.toLowerCase()));
+        if (hitKw) {
+          skippedBlocked++;
+          continue;
+        }
       }
       const link = `https://www.linkedin.com/jobs/view/${id}/`;
       if (!seenIds.has(id)) {
@@ -444,7 +473,7 @@ async function main() {
       }
     }
     if (skippedBlocked > 0) {
-      console.log(`🚫 Skipped ${skippedBlocked} jobs from blocked companies on this page`);
+      console.log(`🚫 Skipped ${skippedBlocked} cards (blocked company or title keyword) on page ${pageIndex + 1}`);
     }
 
     console.log(`📃 Page ${pageIndex + 1}: found ${newOnThisPage} new links (${allLinks.length} total)`);
