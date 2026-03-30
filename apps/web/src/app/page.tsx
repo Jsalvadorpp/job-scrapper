@@ -82,6 +82,7 @@ export default async function HomePage({ searchParams }: PageProps) {
             <StatCard label="Remote" value={stats?.remote ?? 0} color="text-emerald-600" />
             <StatCard label="Hybrid" value={stats?.hybrid ?? 0} color="text-blue-600" />
             <StatCard label="On-site" value={stats?.onsite ?? 0} color="text-orange-600" />
+            <StatCard label="Applied" value={stats?.applied ?? 0} color="text-violet-600" />
           </div>
 
           {/* Settings */}

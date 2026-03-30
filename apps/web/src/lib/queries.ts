@@ -122,6 +122,7 @@ export async function getStats() {
       remote: sql<number>`CAST(COUNT(*) FILTER (WHERE ${jobs.workType} = 'Remote') AS INTEGER)`,
       hybrid: sql<number>`CAST(COUNT(*) FILTER (WHERE ${jobs.workType} = 'Hybrid') AS INTEGER)`,
       onsite: sql<number>`CAST(COUNT(*) FILTER (WHERE ${jobs.workType} = 'On-site') AS INTEGER)`,
+      applied: sql<number>`CAST(COUNT(*) FILTER (WHERE ${jobs.status} = 'applied') AS INTEGER)`,
     })
     .from(jobs);
   return result;
