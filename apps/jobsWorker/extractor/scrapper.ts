@@ -14,7 +14,7 @@ import { asc, inArray } from "drizzle-orm";
 //   pnpm dev:24h  → last 24 hours  (f_TPR=r86400)
 //   pnpm dev:16h  → last 16 hours  (f_TPR=r57600)
 //                   Ideal when running at ~9pm — only shows jobs posted after
-//                   ~5am, skipping any noise posted in the middle of the night
+//                   ~5am, covers full US + Latin America workday
 const TIME_RANGE =
   process.env.TIME_RANGE === "16h" ? "r57600" : "r86400"; // default: 24 h
 
