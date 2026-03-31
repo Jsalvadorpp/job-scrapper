@@ -54,13 +54,15 @@ export function Filters({ total }: { total: number }) {
   const showDismissed = params.get("showDismissed") === "1";
   const hideApplied = params.get("hideApplied") === "1";
   const statusFilter = params.get("statusFilter") ?? "";
+  const last24h = params.get("last24h") === "1";
   const hasFilters = !!(
     params.get("search") ||
     params.get("location") ||
     params.get("workType") ||
     params.get("statusFilter") ||
     params.get("showDismissed") ||
-    params.get("hideApplied")
+    params.get("hideApplied") ||
+    params.get("last24h")
   );
 
   function clearAll() {
@@ -161,6 +163,16 @@ export function Filters({ total }: { total: number }) {
           }`}
         >
           Show hidden
+        </button>
+        <button
+          onClick={() => updateParams({ last24h: last24h ? "" : "1", page: "" })}
+          className={`py-2 px-3 text-sm rounded-lg border transition-colors ${
+            last24h
+              ? "bg-amber-500 border-amber-500 text-white font-medium"
+              : "border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100"
+          }`}
+        >
+          Last 24h
         </button>
 
         {/* Clear filters */}

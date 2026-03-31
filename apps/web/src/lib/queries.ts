@@ -1,7 +1,7 @@
 import { db } from "./db";
 import { blockedCompanies, blockedKeywords, jobs, requiredKeywords } from "./schema";
 import type { BlockedCompany, BlockedKeyword, Job, RequiredKeyword } from "./schema";
-import { and, asc, count, desc, eq, ilike, isNull, ne, not, or, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, isNull, ne, not, or, sql } from "drizzle-orm";
 import { PER_PAGE } from "./constants";
 
 export type { Job, BlockedCompany, BlockedKeyword, RequiredKeyword };
@@ -16,6 +16,7 @@ export interface JobFilters {
   showDismissed?: boolean; // include dismissed jobs (default: false)
   statusFilter?: string;   // "applied" | "all" — show only applied, or all non-dismissed
   hideApplied?: boolean;   // exclude applied jobs from results
+  last24h?: boolean;       // only jobs scraped in the last 24 hours
 }
 
 function buildWhere(filters: JobFilters) {
@@ -54,6 +55,11 @@ function buildWhere(filters: JobFilters) {
   // Hide applied: exclude jobs already applied to
   if (filters.hideApplied) {
     conditions.push(or(isNull(jobs.status), ne(jobs.status, "applied")));
+  }
+
+  // Last 24h: only show jobs scraped in the past 24 hours
+  if (filters.last24h) {
+    conditions.push(gte(jobs.createdAt, sql`now() - interval '24 hours'`));
   }
 
   // Blocked companies: exclude any job whose company is in the blocked_companies table

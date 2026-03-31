@@ -16,6 +16,7 @@ interface PageProps {
     showDismissed?: string;
     statusFilter?: string;
     hideApplied?: string;
+    last24h?: string;
   }>;
 }
 
@@ -50,6 +51,7 @@ export default async function HomePage({ searchParams }: PageProps) {
     showDismissed: sp.showDismissed === "1",
     statusFilter: sp.statusFilter,
     hideApplied: sp.hideApplied === "1",
+    last24h: sp.last24h === "1",
   };
 
   const [jobs, total, stats, blocked] = await Promise.all([
